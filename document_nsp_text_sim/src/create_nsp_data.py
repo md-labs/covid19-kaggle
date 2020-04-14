@@ -10,7 +10,7 @@ import json
 import csv
 import shutil
 import sys
-from bert_document_nsp.utils import ReadData
+from document_nsp_text_sim.utils import ReadData
 
 csv.field_size_limit(sys.maxsize)
 

@@ -16,7 +16,7 @@
 
 #SBATCH -t 1-00:00:00
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=aambalav@asu.edu
+#SBATCH --mail-user=your-email-id@asu.edu
 
 module load anaconda3/5.3.0
 

@@ -7,7 +7,7 @@ Output: Threshold Filtered Results formatted as 'Title', 'Text', 'Label', 'Prob_
 """
 
 
-from bert_document_nsp.utils import ReadData
+from document_nsp_text_sim.utils import ReadData
 import os
 import csv
 import sys

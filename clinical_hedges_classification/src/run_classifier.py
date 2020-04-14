@@ -1,7 +1,7 @@
 """
-BERT finetuning runner for Next Sentence Prediction
-Input: [CLS] Query [SEP] (Title + Abstract) Text [SEP]
-Output: Probability of similarity between Query and Text
+BERT finetuning runner for Text Classification
+Input: [CLS] (Title + Abstract) Text [SEP]
+Output: Classification Labels of Treatment or Other for the Text Input
 """
 
 from __future__ import absolute_import, division, print_function
@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import sys
+import shutil
 import copy
 
 import numpy as np
@@ -22,9 +23,11 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import BertForNextSentencePrediction, BertConfig, WEIGHTS_NAME, CONFIG_NAME
+from pytorch_pretrained_bert.modeling import BertForSequenceClassification, BertConfig, WEIGHTS_NAME, CONFIG_NAME
 from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+from pytorch_pretrained_bert.optimization import BertAdam
+
+from sklearn.metrics import classification_report
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -73,7 +76,7 @@ class DataProcessor(object):
         """Gets a collection of `InputExample`s for the dev set."""
         raise NotImplementedError()
 
-    def get_labels(self):
+    def get_labels(self, index):
         """Gets the list of labels for this data set."""
         raise NotImplementedError()
 
@@ -83,37 +86,18 @@ class DataProcessor(object):
         with open(input_file, "r") as f:
             reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
             lines = []
-            for i, line in enumerate(reader):
-                if i == 0:
-                    continue
+            for line in reader:
                 if sys.version_info[0] == 2:
                     line = list(unicode(cell, 'utf-8') for cell in line)
                 lines.append(line)
             return lines
 
-def get_tp_fp_fn(logits, labels):
-  assert labels.shape[1] == 1
-  labels = labels.squeeze()
-  predictions = np.argmax(logits, axis=1)
-  labels, predictions = labels.astype(int), predictions.astype(int)
-  tp = np.sum(np.logical_and(predictions == 1, labels == 1))
-  fp = np.sum(np.logical_and(predictions == 1, labels == 0))
-  fn = np.sum(np.logical_and(predictions == 0, labels == 1))
-  return tp, fp, fn
 
-def compute_metrics(tp, fp, fn):
-  precision = tp / (tp + fp + np.finfo(float).eps)
-  recall = tp / (tp + fn + np.finfo(float).eps)
-  f1 = 2 * precision * recall / (precision + recall + np.finfo(float).eps)
-  return precision, recall, f1
-
-
-class COVIDProcessor(DataProcessor):
-    """Processor for the CLPsych data set."""
+class InputProcessor(DataProcessor):
+    """Processor for the Clinical Hedges data set."""
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "Train_Data.tsv")))
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "Train_Data.tsv")), "train")
 
@@ -127,40 +111,67 @@ class COVIDProcessor(DataProcessor):
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "Test_Data.tsv")), "test")
 
-    def get_labels(self):
+    def get_labels(self, index):
         """See base class."""
-        return ["VC", "TR"]
+        index = int(index)
+        if(index == 0):
+            return ["NA", "O"]
+        elif(index == 1):
+            return ["F", "T"]
+        elif(index == 2):
+            return ["NA", "TR"]
+        elif(index == 3):
+            return ["F", "T"]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
-        random.seed(42)
         req = list()
         for i in range(0, len(lines)):
             req.append(i)
-        req_final = random.sample(req, len(lines))	
+        req_final = random.sample(req, len(lines))
         for i in req_final:
-            # print(lines[i])
+            if i == 0:
+                continue
             guid = lines[i][0]
             text_a = lines[i][1]
-            text_b = lines[i][2]
-            label = lines[i][-1]
+            text_b = None
+            label = lines[i][2]
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-        return examples   
+        return examples
 
 
-def convert_examples_to_features(examples, label_list, max_seq_length,
-                                 tokenizer, output_mode="classification"):
+def accuracy(out, labels):
+    outputs = np.argmax(out, axis=1)
+    return np.sum(outputs == labels)
+
+
+def get_tp_fp_fn(logits, labels):
+  assert labels.shape[1] == 1
+  labels = labels.squeeze()
+  predictions = np.argmax(logits, axis=1)
+  labels, predictions = labels.astype(int), predictions.astype(int)
+  tp = np.sum(np.logical_and(predictions == 1, labels == 1))
+  fp = np.sum(np.logical_and(predictions == 1, labels == 0))
+  fn = np.sum(np.logical_and(predictions == 0, labels == 1))
+  return tp, fp, fn
+
+
+def compute_metrics(tp, fp, fn):
+  precision = tp / (tp + fp + np.finfo(float).eps)
+  recall = tp / (tp + fn + np.finfo(float).eps)
+  f1 = 2 * precision * recall / (precision + recall + np.finfo(float).eps)
+  return precision, recall, f1
+
+
+def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer):
     """Loads a data file into a list of `InputBatch`s."""
 
     label_map = {label : i for i, label in enumerate(label_list)}
 
     features = []
     for (ex_index, example) in enumerate(examples):
-        if ex_index % 10000 == 0:
-            logger.info("Writing example %d of %d" % (ex_index, len(examples)))
-
         tokens_a = tokenizer.tokenize(example.text_a)
 
         tokens_b = None
@@ -187,7 +198,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
         # sequence or the second sequence. The embedding vectors for `type=0` and
         # `type=1` were learned during pre-training and are added to the wordpiece
         # embedding vector (and position vector). This is not *strictly* necessary
-        # since the [SEP] token unambiguously separates the sequences, but it makes
+        # since the [SEP] token unambigiously separates the sequences, but it makes
         # it easier for the model to learn the concept of sequences.
         #
         # For classification tasks, the first vector (corresponding to [CLS]) is
@@ -216,23 +227,17 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
 
-        if output_mode == "classification":
-            label_id = label_map[example.label]
-        elif output_mode == "regression":
-            label_id = float(example.label)
-        else:
-            raise KeyError(output_mode)
-
-        if ex_index < 5:
-            logger.info("*** Example ***")
-            logger.info("guid: %s" % (example.guid))
-            logger.info("tokens: %s" % " ".join(
-                    [str(x) for x in tokens]))
-            logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            logger.info(
-                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-            logger.info("label: %s (id = %d)" % (example.label, label_id))
+        label_id = label_map[example.label]
+        #if ex_index < 5:
+        #    logger.info("*** Example ***")
+        #    logger.info("guid: %s" % (example.guid))
+        #    logger.info("tokens: %s" % " ".join(
+        #            [str(x) for x in tokens]))
+        #    logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+        #    logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+        #    logger.info(
+        #            "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+        #    logger.info("label: %s (id = %d)" % (example.label, label_id))
 
         features.append(
                 InputFeatures(input_ids=input_ids,
@@ -240,7 +245,6 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
                               segment_ids=segment_ids,
                               label_id=label_id))
     return features
-
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -259,23 +263,21 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
         else:
             tokens_b.pop()
 
-
-def accuracy(out, labels):
-    outputs = np.argmax(out, axis=1)
-    return np.sum(outputs == labels)
-
-
 def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters
-    parser.add_argument("--model_file", default=None, type=str, required=True)	
     parser.add_argument("--data_dir",
                         default="",
                         type=str,
                         required=True,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-    parser.add_argument("--bert_model", default="", type=str, 
+    parser.add_argument("--model_dir", default="", type=str,
+                        required=True,
+                        help="Bert pre-trained model selected in the list: bert-base-uncased, "
+                        "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
+                        "bert-base-multilingual-cased, bert-base-chinese or any pretrained model directory with model.bin and config file")
+    parser.add_argument("--vocab_dir", default="", type=str,
                         required=True,
                         help="Bert pre-trained model selected in the list: bert-base-uncased, "
                         "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
@@ -290,6 +292,12 @@ def main():
                         type=str,
                         required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
+
+    parser.add_argument("--task_num",
+                        default=-1,
+                        type=int,
+                        required=True,
+                        help="The task number of Clinical Hedges Tasks to run")
 
     ## Other parameters
     parser.add_argument("--cache_dir",
@@ -367,11 +375,11 @@ def main():
         ptvsd.wait_for_attach()
 
     processors = {
-		"covid": COVIDProcessor,
+        "clinicalhedges": InputProcessor,
     }
 
     num_labels_task = {
-        "covid": 2,
+        "clinicalhedges": [2, 2, 2, 2],
     }
 
     if args.local_rank == -1 or args.no_cuda:
@@ -400,21 +408,22 @@ def main():
 
     if not args.do_train and not args.do_eval:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
-        
+
 
     task_name = args.task_name.lower()
-
+    task_num = args.task_num
     if task_name not in processors:
-        raise ValueError("Task not found: %s" % (task_name))
+        raise ValueError("Task not found: %s" % task_name)
 
     processor = processors[task_name]()
     print(processor)
-    num_labels = num_labels_task[task_name]
+    num_labels = num_labels_task[task_name][task_num-1]
     print(num_labels)
-    label_list = processor.get_labels()
+    label_list = processor.get_labels(task_num-1)
     print(label_list)
-    
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+
+    tokenizer = BertTokenizer.from_pretrained(args.vocab_dir, do_lower_case=args.do_lower_case)
+    file = open(os.path.join(args.output_dir, "Classification_Reports_Task_{}.txt".format(task_num)), 'w')
 
     train_examples = None
     num_train_optimization_steps = None
@@ -427,8 +436,9 @@ def main():
 
     # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
-    model = BertForNextSentencePrediction.from_pretrained(args.model_file,
-              cache_dir=cache_dir)
+    model = BertForSequenceClassification.from_pretrained(args.model_dir,
+              cache_dir=cache_dir,
+              num_labels = num_labels)
     if args.fp16:
         model.half()
     model.to(device)
@@ -477,7 +487,7 @@ def main():
     if args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer)
-        logger.info("***** Running training *****")
+        logger.info("***** Running training for Task {}*****".format(task_num))
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
@@ -514,12 +524,6 @@ def main():
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    if args.fp16:
-                        # modify learning rate with special warm up BERT uses
-                        # if args.fp16 is False, BertAdam is used that handles this automatically
-                        lr_this_step = args.learning_rate * warmup_linear(global_step/num_train_optimization_steps, args.warmup_proportion)
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr_this_step
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -537,31 +541,31 @@ def main():
             # Run prediction for full data
             eval_sampler = SequentialSampler(eval_data)
             eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
-    					
+
             model.eval()
             eval_loss, eval_accuracy = 0, 0
             nb_eval_steps, nb_eval_examples = 0, 0
-    
+
             for input_ids, input_mask, segment_ids, label_ids in eval_dataloader:
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
                 label_ids = label_ids.to(device)
-    
+
                 with torch.no_grad():
                     tmp_eval_loss = model(input_ids, segment_ids, input_mask, label_ids)
                     logits = model(input_ids, segment_ids, input_mask)
-    
+
                 logits = logits.detach().cpu().numpy()
                 label_ids = label_ids.to('cpu').numpy()
                 tmp_eval_accuracy = accuracy(logits, label_ids)
-    
+
                 eval_loss += tmp_eval_loss.mean().item()
                 eval_accuracy += tmp_eval_accuracy
-    
+
                 nb_eval_examples += input_ids.size(0)
                 nb_eval_steps += 1
-    
+
             eval_loss = eval_loss / nb_eval_steps
             eval_accuracy = eval_accuracy / nb_eval_examples
             loss = tr_loss/nb_tr_steps if args.do_train else None
@@ -569,42 +573,29 @@ def main():
                       'eval_accuracy': eval_accuracy,
                       'global_step': global_step,
                       'loss': loss}
-    
+
             for key in sorted(result.keys()):
                 print(key, str(result[key]))
             print()
-            
-    if args.do_train and args.do_eval:
+
+    if args.do_train:
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
+        if(os.path.exists(os.path.join(args.output_dir, "Model_Task_{}".format(task_num)))):
+            shutil.rmtree(os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num)))
+        os.mkdir(os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num)))
+        output_model_file = os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num), WEIGHTS_NAME)
         torch.save(model_to_save.state_dict(), output_model_file)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        output_config_file = os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num), CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
+    if args.do_eval:
         # Load a trained model and config that you have fine-tuned
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
+        output_model_file = os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num), WEIGHTS_NAME)
+        output_config_file = os.path.join(args.output_dir, "Model_Part_Task_{}".format(task_num), CONFIG_NAME)
         config = BertConfig(output_config_file)
-        model = BertForNextSentencePrediction(config)
-        model.load_state_dict(torch.load(output_model_file))
-    elif args.do_train:
-        # Save a trained model and the associated configuration
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        torch.save(model_to_save.state_dict(), output_model_file)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        with open(output_config_file, 'w') as f:
-            f.write(model_to_save.config.to_json_string())	
-    else:
-        # Load a trained model and config that you have fine-tuned
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
-        output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
-        config = BertConfig(output_config_file)
-        # model = BertForNextSentencePrediction(config)
-        # model.bert.load_state_dict(torch.load(output_model_file))
-        model = BertForNextSentencePrediction.from_pretrained(args.model_file,
-                                                              cache_dir=cache_dir)
+        model = BertForSequenceClassification(config, num_labels=num_labels)
+        model.load_state_dict(torch.load(output_model_file, map_location='cpu'))
     model.to(device)
 
     if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
@@ -614,7 +605,7 @@ def main():
         complete_user_ids = list()
         for example in eval_examples:
             complete_user_ids.append(example.guid)
-        logger.info("***** Running evaluation *****")
+        logger.info("***** Running Test for Task {}*****".format(task_num))
         logger.info("  Num examples = %d", len(eval_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
         all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
@@ -643,7 +634,6 @@ def main():
 
             last_layer_op = copy.deepcopy(logits)
             logits = logits.detach().cpu().numpy()
-            print(logits)
             sm = torch.nn.Softmax()
             probabilities = sm(last_layer_op)
             probabilities = probabilities.detach().cpu().numpy()
@@ -652,14 +642,35 @@ def main():
             outputs = np.argmax(logits, axis=1)
             complete_outputs.extend(outputs)
             complete_label_ids.extend(label_ids)
-            complete_probs.extend(probabilities[:, 1])
+            complete_probs.extend(probabilities[:,1])
 
-        outcsv = open(os.path.join(args.output_dir, "Reqd_Labels.csv"),'w', encoding = 'utf8', newline='')
-        writer = csv.writer(outcsv,quotechar = '"')
-        writer.writerow(["ID", "Probs"])
-        for user,true, pred, probs in zip(complete_user_ids, complete_label_ids, complete_outputs, complete_probs):
-            writer.writerow([user, probs])
+            eval_loss += tmp_eval_loss.mean().item()
+            eval_accuracy += tmp_eval_accuracy
 
+            nb_eval_examples += input_ids.size(0)
+            nb_eval_steps += 1
+
+        outcsv = open(os.path.join(args.output_dir, "Reqd_Labels_Task_{}.csv".format(task_num)),'w', encoding = 'utf8', newline='')
+        writer = csv.writer(outcsv, quotechar = '"')
+        writer.writerow(["ID", "True", "Pred"])
+        for user, true, pred, prob in zip(complete_user_ids, complete_label_ids, complete_outputs, complete_probs):
+            writer.writerow([user,true,pred, prob])
+        outcsv.close()
+        eval_loss = eval_loss / nb_eval_steps
+        eval_loss = eval_loss / nb_eval_steps
+
+
+        eval_loss = eval_loss / nb_eval_steps
+        eval_accuracy = eval_accuracy / nb_eval_examples
+        loss = tr_loss/nb_tr_steps if args.do_train else None
+        result = {'eval_loss': eval_loss,
+                  'eval_accuracy': eval_accuracy,
+                  'global_step': global_step,
+                  'loss': loss}
+        print(result)
+
+        file.write("\nClassification Report\n\n" + classification_report(complete_label_ids, complete_outputs) + "\n\n\n")
+    file.close()
 
 if __name__ == "__main__":
     main()
