@@ -1,5 +1,5 @@
 tensorflow==2.0.0
-tensorflow-gpu==2.0.0
+tensorflow-gpu==2.6.4
 transformers
 docopt==0.6.1
 astropy==4.0
